@@ -23,14 +23,6 @@ Pre-built binaries are available from the [binaries](binaries/) page:
 | Windows | `USB Share_x.x.x_x64-setup.exe` or `.msi` |
 | Linux | `.AppImage`, `.deb`, or `.rpm` |
 
-## Tech Stack
-
-- **Frontend**: Vue 3 + TypeScript + Tailwind CSS
-- **Backend**: Rust + Tauri 2
-- **USB Access**: nusb crate (pure Rust)
-- **Discovery**: mDNS/DNS-SD
-- **Encryption**: rustls
-
 ## How It Works
 
 ### Host Mode
