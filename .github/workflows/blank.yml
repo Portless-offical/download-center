@@ -1,0 +1,467 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Sync Releases from R2
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to sync (leave empty for latest)'
+        required: false
+        type: string
+      sync_all:
+        description: 'Sync all versions from R2'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Prepare Sync
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      versions: ${{ steps.detect.outputs.versions }}
+      should_sync: ${{ steps.detect.outputs.should_sync }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Install AWS CLI
+        run: |
+          curl "https://awscli.amazonaws. com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          sudo ./aws/install --update
+
+      - name: Detect version to sync
+        id: detect
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          INPUT_VERSION: ${{ inputs.version }}
+          SYNC_ALL: ${{ inputs.sync_all }}
+        run: |
+          set -euo pipefail
+
+          # Validate R2 configuration
+          if [[ -z "$R2_ENDPOINT_URL" || -z "$R2_BUCKET_NAME" ]]; then
+            echo "::error::R2 configuration not set"
+            exit 1
+          fi
+
+          if [[ "$SYNC_ALL" == "true" ]]; then
+            echo "Syncing all versions from R2..."
+            
+            # List all version directories
+            VERSIONS=$(aws s3api list-objects-v2 \
+              --bucket "${R2_BUCKET_NAME}" \
+              --prefix "releases/" \
+              --delimiter "/" \
+              --endpoint-url "${R2_ENDPOINT_URL}" \
+              --region auto \
+              --query 'CommonPrefixes[]. Prefix' \
+              --output text | tr ' ' '\n' | grep -oP 'v[0-9. ]+(? =/)' | sort -V | tr '\n' ',' | sed 's/,$//')
+            
+            echo "versions=${VERSIONS}" >> "$GITHUB_OUTPUT"
+            echo "should_sync=true" >> "$GITHUB_OUTPUT"
+            echo "Detected versions: ${VERSIONS}"
+          elif [[ -n "$INPUT_VERSION" ]]; then
+            echo "Using specified version: $INPUT_VERSION"
+            echo "version=${INPUT_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "should_sync=true" >> "$GITHUB_OUTPUT"
+          else
+            # Get latest version from releases/latest. json
+            if aws s3api head-object \
+              --bucket "${R2_BUCKET_NAME}" \
+              --key "releases/latest.json" \
+              --endpoint-url "${R2_ENDPOINT_URL}" \
+              --region auto 2>/dev/null; then
+              
+              aws s3 cp "s3://${R2_BUCKET_NAME}/releases/latest. json" /tmp/latest.json \
+                --endpoint-url "${R2_ENDPOINT_URL}" \
+                --region auto \
+                --only-show-errors
+              
+              LATEST_VERSION=$(jq -r '.version' /tmp/latest.json)
+              echo "version=${LATEST_VERSION}" >> "$GITHUB_OUTPUT"
+              echo "should_sync=true" >> "$GITHUB_OUTPUT"
+              echo "Latest version from R2: ${LATEST_VERSION}"
+            else
+              # Fallback: list all versions and get the latest
+              LATEST_VERSION=$(aws s3api list-objects-v2 \
+                --bucket "${R2_BUCKET_NAME}" \
+                --prefix "releases/" \
+                --delimiter "/" \
+                --endpoint-url "${R2_ENDPOINT_URL}" \
+                --region auto \
+                --query 'CommonPrefixes[].Prefix' \
+                --output text | tr ' ' '\n' | grep -oP 'v[0-9.]+(?=/)' | sort -V | tail -1)
+              
+              if [[ -z "$LATEST_VERSION" ]]; then
+                echo "::error::No releases found in R2"
+                echo "should_sync=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              
+              echo "version=${LATEST_VERSION}" >> "$GITHUB_OUTPUT"
+              echo "should_sync=true" >> "$GITHUB_OUTPUT"
+              echo "Latest version detected: ${LATEST_VERSION}"
+            fi
+          fi
+
+  sync:
+    name: Sync Version (${{ matrix.version }})
+    needs: prepare
+    if: needs.prepare.outputs.should_sync == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJson(format('["{0}"]', needs.prepare.outputs.version != '' && needs.prepare.outputs.version || needs.prepare.outputs.versions)) }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install AWS CLI
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          sudo ./aws/install --update
+
+      - name: Download release artifacts from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_DIR="binaries/${VERSION}"
+          mkdir -p "${RELEASE_DIR}"
+
+          echo "Downloading artifacts for ${VERSION}..."
+          
+          # List all files in the version directory
+          aws s3api list-objects-v2 \
+            --bucket "${R2_BUCKET_NAME}" \
+            --prefix "releases/${VERSION}/" \
+            --endpoint-url "${R2_ENDPOINT_URL}" \
+            --region auto \
+            --output json > /tmp/r2_listing.json
+
+          # Download each file
+          python3 << 'PYTHON_SCRIPT'
+          import json
+          import subprocess
+          import os
+
+          version = os.environ['VERSION']
+          bucket = os.environ['R2_BUCKET_NAME']
+          endpoint = os.environ['R2_ENDPOINT_URL']
+          release_dir = f"binaries/{version}"
+
+          with open('/tmp/r2_listing.json', 'r') as f:
+              data = json.load(f)
+
+          file_count = 0
+          if 'Contents' in data:
+              for obj in data['Contents']:
+                  key = obj['Key']
+                  filename = os.path.basename(key)
+                  
+                  # Skip manifest files
+                  if filename.endswith('.json'):
+                      continue
+                  
+                  local_path = os.path.join(release_dir, filename)
+                  
+                  print(f"Downloading {filename}...")
+                  
+                  cmd = [
+                      'aws', 's3', 'cp',
+                      f"s3://{bucket}/{key}",
+                      local_path,
+                      '--endpoint-url', endpoint,
+                      '--region', 'auto',
+                      '--only-show-errors'
+                  ]
+                  
+                  if subprocess.run(cmd). returncode == 0:
+                      print(f"✓ Downloaded {filename}")
+                      file_count += 1
+                  else:
+                      print(f"✗ Failed to download {filename}")
+          
+          print(f"\nTotal files downloaded: {file_count}")
+          if file_count == 0:
+              raise Exception("No files were downloaded")
+          
+          PYTHON_SCRIPT
+
+      - name: Generate manifest for version
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_DIR="binaries/${VERSION}"
+          
+          # Generate manifest
+          cat > "${RELEASE_DIR}/manifest.json" << 'EOF'
+          {
+            "version": "${{ matrix.version }}",
+            "released_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "assets": []
+          }
+          EOF
+
+          python3 << 'PYTHON_SCRIPT'
+          import json
+          import os
+          import glob
+
+          version = os.environ['VERSION']
+          public_url = os.environ. get('R2_PUBLIC_URL', '').rstrip('/')
+          release_dir = f"binaries/{version}"
+
+          platform_map = {
+              '. dmg': 'darwin',
+              '.AppImage': 'linux',
+              '.deb': 'linux',
+              '.rpm': 'linux',
+              '.msi': 'windows',
+              '.exe': 'windows'
+          }
+
+          assets = []
+          
+          # Find all files in the release directory
+          for filepath in glob.glob(f"{release_dir}/*"):
+              if os.path.isfile(filepath):
+                  filename = os.path.basename(filepath)
+                  
+                  # Skip manifest
+                  if filename == 'manifest.json':
+                      continue
+                  
+                  size = os.path.getsize(filepath)
+                  
+                  # Determine platform
+                  platform = 'unknown'
+                  for ext, plat in platform_map.items():
+                      if filename.endswith(ext):
+                          platform = plat
+                          break
+                  
+                  # Build download URL
+                  url = f"{public_url}/{release_dir}/{filename}" if public_url else f"{release_dir}/{filename}"
+                  
+                  assets.append({
+                      "filename": filename,
+                      "size": size,
+                      "platform": platform,
+                      "url": url
+                  })
+          
+          manifest = {
+              "version": version,
+              "released_at": "2025-11-27T00:00:00Z",  # Will be updated by next step
+              "assets": assets
+          }
+          
+          with open(f"{release_dir}/manifest.json", 'w') as f:
+              json.dump(manifest, f, indent=2)
+          
+          print(f"Generated manifest with {len(assets)} assets")
+          
+          PYTHON_SCRIPT
+
+      - name: List downloaded files
+        run: |
+          echo "Files in binaries/${{ matrix.version }}:"
+          ls -lh "binaries/${{ matrix. version }}/"
+
+  commit-and-push:
+    name: Commit and Push Changes
+    needs: [prepare, sync]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    if: success()
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: . 
+
+      - name: Setup git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create commit for synced releases
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git add binaries/
+          git commit -m "chore: sync releases from R2 storage"
+          git push origin HEAD
+
+      - name: Create release notes
+        env:
+          GITHUB_TOKEN: ${{ secrets. GITHUB_TOKEN }}
+          VERSIONS: ${{ needs.prepare.outputs.versions }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Determine which versions to create releases for
+          if [[ -n "$VERSIONS" ]]; then
+            RELEASE_VERSIONS="${VERSIONS}"
+          else
+            RELEASE_VERSIONS="${VERSION}"
+          fi
+
+          echo "Creating/updating releases for: ${RELEASE_VERSIONS}"
+          
+          for RELEASE_VERSION in ${RELEASE_VERSIONS//,/ }; do
+            RELEASE_DIR="binaries/${RELEASE_VERSION}"
+            
+            if [[ !  -d "$RELEASE_DIR" ]]; then
+              echo "Release directory not found: ${RELEASE_DIR}"
+              continue
+            fi
+
+            echo "Processing release ${RELEASE_VERSION}..."
+            
+            # Check if release already exists
+            if gh release view "${RELEASE_VERSION}" 2>/dev/null; then
+              echo "Release ${RELEASE_VERSION} already exists, skipping"
+              continue
+            fi
+
+            # Collect all files for this release
+            FILES=$(find "${RELEASE_DIR}" -maxdepth 1 -type f !  -name "manifest.json" -printf "%p ")
+
+            if [[ -z "$FILES" ]]; then
+              echo "No files found for release ${RELEASE_VERSION}"
+              continue
+            fi
+
+            # Create release
+            gh release create "${RELEASE_VERSION}" \
+              --title "Portless ${RELEASE_VERSION}" \
+              --notes "Release synchronized from R2 storage" \
+              --draft=false \
+              --prerelease=false \
+              $FILES || true
+          done
+
+  update-latest:
+    name: Update Latest Release
+    needs: [prepare, commit-and-push]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    if: success()
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Update latest symlink/reference
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          R2_PUBLIC_URL: ${{ secrets. R2_PUBLIC_URL }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::Version not determined"
+            exit 1
+          fi
+
+          # Install AWS CLI
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64. zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          sudo ./aws/install --update
+
+          echo "Creating/updating latest. json for version ${VERSION}..."
+
+          # Generate latest. json
+          cat > /tmp/latest.json << EOF
+          {
+            "version": "${VERSION}",
+            "download_url": "${R2_PUBLIC_URL}/releases/${VERSION}",
+            "binaries_url": "${R2_PUBLIC_URL}/binaries/${VERSION}",
+            "released_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+          # Upload latest.json to multiple locations for easy access
+          aws s3 cp /tmp/latest.json "s3://${R2_BUCKET_NAME}/latest.json" \
+            --endpoint-url "${R2_ENDPOINT_URL}" \
+            --region auto \
+            --content-type "application/json" \
+            --cache-control "max-age=300" \
+            --only-show-errors
+
+          aws s3 cp /tmp/latest.json "s3://${R2_BUCKET_NAME}/releases/latest.json" \
+            --endpoint-url "${R2_ENDPOINT_URL}" \
+            --region auto \
+            --content-type "application/json" \
+            --cache-control "max-age=300" \
+            --only-show-errors
+
+          echo "✓ Latest version reference updated: ${VERSION}"
+          echo ""
+          echo "Access points:"
+          echo "  - Latest metadata: ${R2_PUBLIC_URL}/latest.json"
+          echo "  - Latest metadata: ${R2_PUBLIC_URL}/releases/latest.json"
+          echo "  - Binaries: ${R2_PUBLIC_URL}/binaries/${VERSION}/"
+          echo "  - Releases: ${R2_PUBLIC_URL}/releases/${VERSION}/"
+
+  notify-success:
+    name: Notify Success
+    needs: [prepare, update-latest]
+    runs-on: ubuntu-22.04
+    if: success()
+    
+    steps:
+      - name: Log success
+        run: |
+          echo "✓ Release sync workflow completed successfully"
+          echo ""
+          echo "Version: ${{ needs.prepare.outputs.version }}"
+          echo "Sync completed at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
