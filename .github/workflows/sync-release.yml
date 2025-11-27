@@ -31,10 +31,8 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 env:
-  CARGO_TERM_COLOR: always
   AWS_MAX_ATTEMPTS: 3
   AWS_RETRY_MODE: adaptive
 
@@ -63,13 +61,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install AWS CLI
-        run: |
-          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
-          unzip -q /tmp/awscliv2.zip -d /tmp
-          sudo /tmp/aws/install --update
-          aws --version
-
       - name: Validate R2 Configuration
         id: validate
         env:
@@ -82,24 +73,14 @@ jobs:
 
           echo "::group::Validating R2 Configuration"
 
-          # Define required secrets
-          declare -A REQUIRED_SECRETS=(
-            ["R2_ACCESS_KEY_ID"]="${{ secrets.R2_ACCESS_KEY_ID }}"
-            ["R2_SECRET_ACCESS_KEY"]="${{ secrets.R2_SECRET_ACCESS_KEY }}"
-            ["R2_ENDPOINT_URL"]="${R2_ENDPOINT_URL}"
-            ["R2_BUCKET_NAME"]="${R2_BUCKET_NAME}"
-          )
-
-          # Validate all required secrets
+          # Validate required secrets
           VALIDATION_FAILED=false
-          for SECRET_NAME in "${!REQUIRED_SECRETS[@]}"; do
-            SECRET_VALUE="${REQUIRED_SECRETS[$SECRET_NAME]}"
-            if [[ -z "$SECRET_VALUE" ]]; then
-              echo "::error::${SECRET_NAME} secret is not set"
+          for VAR_NAME in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY R2_ENDPOINT_URL R2_BUCKET_NAME; do
+            if [[ -z "${!VAR_NAME:-}" ]]; then
+              echo "::error::${VAR_NAME} is not set"
               VALIDATION_FAILED=true
             else
-              # Mask sensitive values, show length for debugging
-              echo "✓ ${SECRET_NAME} is set (length: ${#SECRET_VALUE})"
+              echo "✓ ${VAR_NAME} is set (length: ${#!VAR_NAME})"
             fi
           done
 
@@ -121,7 +102,7 @@ jobs:
           if aws s3 ls "s3://${R2_BUCKET_NAME}" \
             --endpoint-url "${R2_ENDPOINT_URL}" \
             --region auto &>/dev/null; then
-            echo "✓ Successfully connected to R2 bucket"
+            echo "✓ Successfully connected to R2 bucket: ${R2_BUCKET_NAME}"
           else
             echo "::error::Failed to connect to R2 bucket"
             echo "Please verify your R2 credentials and configuration"
@@ -162,7 +143,6 @@ jobs:
 
           # Function to get latest version
           get_latest_version() {
-            # Try to get from latest.json first
             if aws s3api head-object \
               --bucket "${R2_BUCKET_NAME}" \
               --key "releases/latest.json" \
@@ -211,6 +191,7 @@ jobs:
             echo "should_sync=false" >> "$GITHUB_OUTPUT"
             echo "versions_count=0" >> "$GITHUB_OUTPUT"
             echo "versions_json=[]" >> "$GITHUB_OUTPUT"
+            echo "latest_version=" >> "$GITHUB_OUTPUT"
           else
             echo "Found ${#VERSIONS_ARRAY[@]} version(s) to sync:"
             printf '  - %s\n' "${VERSIONS_ARRAY[@]}"
@@ -228,14 +209,16 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## Sync Preparation Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Should Sync | ${{ steps.detect.outputs.should_sync }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Versions Count | ${{ steps.detect.outputs.versions_count }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Latest Version | ${{ steps.detect.outputs.latest_version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Dry Run | ${{ inputs.dry_run }} |" >> $GITHUB_STEP_SUMMARY
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## Sync Preparation Summary
+
+          | Parameter | Value |
+          |-----------|-------|
+          | Should Sync | ${{ steps.detect.outputs.should_sync }} |
+          | Versions Count | ${{ steps.detect.outputs.versions_count }} |
+          | Latest Version | ${{ steps.detect.outputs.latest_version }} |
+          | Dry Run | ${{ inputs.dry_run }} |
+          EOF
 
   # ============================================================================
   # Job 2: Download and process each version (matrix job)
@@ -255,20 +238,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Install AWS CLI
-        run: |
-          if ! command -v aws &> /dev/null; then
-            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
-            unzip -q /tmp/awscliv2.zip -d /tmp
-            sudo /tmp/aws/install --update
-          fi
-          aws --version
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
 
       - name: Download release artifacts from R2
         id: download
@@ -301,86 +270,54 @@ jobs:
           if [[ "$FILE_COUNT" -eq 0 ]]; then
             echo "::warning::No files found for version ${VERSION}"
             echo "download_count=0" >> "$GITHUB_OUTPUT"
+            echo "::endgroup::"
             exit 0
           fi
 
-          # Download files using Python for better error handling
-          python3 << 'PYTHON_SCRIPT'
-          import json
-          import subprocess
-          import os
-          import sys
-          from pathlib import Path
+          # Download files
+          DOWNLOADED=0
+          FAILED=0
+          SKIPPED=0
 
-          version = os.environ['VERSION']
-          bucket = os.environ['R2_BUCKET_NAME']
-          endpoint = os.environ['R2_ENDPOINT_URL']
-          release_dir = Path(f"binaries/{version}")
+          for KEY in $(jq -r '.Contents[].Key // empty' /tmp/r2_listing.json); do
+            FILENAME=$(basename "$KEY")
+            [[ -z "$FILENAME" ]] && continue
 
-          # File extensions to download (skip metadata files)
-          BINARY_EXTENSIONS = {'.dmg', '.AppImage', '.deb', '.rpm', '.msi', '.exe', '.tar.gz', '.zip'}
-          SKIP_EXTENSIONS = {'.json', '.txt', '.md', '.sig', '.sha256'}
+            # Skip metadata files
+            if [[ "$FILENAME" =~ \.(json|txt|md|sig|sha256)$ ]]; then
+              echo "⊘ Skipping metadata: $FILENAME"
+              ((SKIPPED++))
+              continue
+            fi
 
-          with open('/tmp/r2_listing.json', 'r') as f:
-              data = json.load(f)
+            SIZE=$(jq -r --arg key "$KEY" '.Contents[] | select(.Key == $key) | .Size // 0' /tmp/r2_listing.json)
+            SIZE_MB=$(echo "scale=1; $SIZE / 1048576" | bc)
 
-          downloaded = 0
-          failed = 0
-          skipped = 0
+            echo "↓ Downloading ${FILENAME} (${SIZE_MB} MB)..."
 
-          for obj in data.get('Contents', []):
-              key = obj['Key']
-              filename = os.path.basename(key)
+            if aws s3 cp "s3://${R2_BUCKET_NAME}/${KEY}" "${RELEASE_DIR}/${FILENAME}" \
+              --endpoint-url "${R2_ENDPOINT_URL}" \
+              --region auto \
+              --only-show-errors; then
+              echo "  ✓ Downloaded ${FILENAME}"
+              ((DOWNLOADED++))
+            else
+              echo "  ✗ Failed to download ${FILENAME}"
+              ((FAILED++))
+            fi
+          done
 
-              if not filename:
-                  continue
+          echo ""
+          echo "Download Summary: ${DOWNLOADED} downloaded, ${FAILED} failed, ${SKIPPED} skipped"
 
-              # Check if we should skip this file
-              ext = ''.join(Path(filename).suffixes).lower()
-              if any(filename.endswith(skip_ext) for skip_ext in SKIP_EXTENSIONS):
-                  print(f"⊘ Skipping metadata file: {filename}")
-                  skipped += 1
-                  continue
-
-              local_path = release_dir / filename
-              size_mb = obj.get('Size', 0) / (1024 * 1024)
-
-              print(f"↓ Downloading {filename} ({size_mb:.1f} MB)...")
-
-              cmd = [
-                  'aws', 's3', 'cp',
-                  f"s3://{bucket}/{key}",
-                  str(local_path),
-                  '--endpoint-url', endpoint,
-                  '--region', 'auto',
-                  '--only-show-errors'
-              ]
-
-              result = subprocess.run(cmd, capture_output=True, text=True)
-
-              if result.returncode == 0:
-                  print(f"  ✓ Downloaded {filename}")
-                  downloaded += 1
-              else:
-                  print(f"  ✗ Failed: {result.stderr}", file=sys.stderr)
-                  failed += 1
-
-          print(f"\n{'='*50}")
-          print(f"Download Summary:")
-          print(f"  Downloaded: {downloaded}")
-          print(f"  Failed: {failed}")
-          print(f"  Skipped: {skipped}")
-
-          # Write output for GitHub Actions
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"download_count={downloaded}\n")
-              f.write(f"failed_count={failed}\n")
-
-          if failed > 0:
-              sys.exit(1)
-          PYTHON_SCRIPT
+          echo "download_count=${DOWNLOADED}" >> "$GITHUB_OUTPUT"
+          echo "failed_count=${FAILED}" >> "$GITHUB_OUTPUT"
 
           echo "::endgroup::"
+
+          if [[ "$FAILED" -gt 0 ]]; then
+            echo "::warning::${FAILED} file(s) failed to download"
+          fi
 
       - name: Generate manifest
         id: manifest
@@ -405,95 +342,66 @@ jobs:
           public_url = os.environ.get('R2_PUBLIC_URL', '').rstrip('/')
           release_dir = Path(f"binaries/{version}")
 
-          # Platform detection based on file extension and name patterns
           def detect_platform(filename: str) -> dict:
               filename_lower = filename.lower()
-
-              platform_info = {
-                  'os': 'unknown',
-                  'arch': 'unknown',
-                  'format': 'unknown'
-              }
+              info = {'os': 'unknown', 'arch': 'unknown', 'format': 'unknown'}
 
               # Detect OS
               if '.dmg' in filename_lower or 'darwin' in filename_lower or 'macos' in filename_lower:
-                  platform_info['os'] = 'darwin'
+                  info['os'] = 'darwin'
               elif '.appimage' in filename_lower or '.deb' in filename_lower or '.rpm' in filename_lower or 'linux' in filename_lower:
-                  platform_info['os'] = 'linux'
+                  info['os'] = 'linux'
               elif '.msi' in filename_lower or '.exe' in filename_lower or 'windows' in filename_lower or 'win' in filename_lower:
-                  platform_info['os'] = 'windows'
+                  info['os'] = 'windows'
 
               # Detect architecture
               if 'arm64' in filename_lower or 'aarch64' in filename_lower:
-                  platform_info['arch'] = 'arm64'
+                  info['arch'] = 'arm64'
               elif 'x64' in filename_lower or 'x86_64' in filename_lower or 'amd64' in filename_lower:
-                  platform_info['arch'] = 'x64'
+                  info['arch'] = 'x64'
               elif 'x86' in filename_lower or 'i386' in filename_lower or 'i686' in filename_lower:
-                  platform_info['arch'] = 'x86'
+                  info['arch'] = 'x86'
               elif 'universal' in filename_lower:
-                  platform_info['arch'] = 'universal'
+                  info['arch'] = 'universal'
 
               # Detect format
-              if filename_lower.endswith('.dmg'):
-                  platform_info['format'] = 'dmg'
-              elif filename_lower.endswith('.appimage'):
-                  platform_info['format'] = 'appimage'
-              elif filename_lower.endswith('.deb'):
-                  platform_info['format'] = 'deb'
-              elif filename_lower.endswith('.rpm'):
-                  platform_info['format'] = 'rpm'
-              elif filename_lower.endswith('.msi'):
-                  platform_info['format'] = 'msi'
-              elif filename_lower.endswith('.exe'):
-                  platform_info['format'] = 'exe'
-              elif filename_lower.endswith('.tar.gz'):
-                  platform_info['format'] = 'tar.gz'
-              elif filename_lower.endswith('.zip'):
-                  platform_info['format'] = 'zip'
+              for ext, fmt in [('.dmg', 'dmg'), ('.appimage', 'appimage'), ('.deb', 'deb'),
+                               ('.rpm', 'rpm'), ('.msi', 'msi'), ('.exe', 'exe'),
+                               ('.tar.gz', 'tar.gz'), ('.zip', 'zip')]:
+                  if filename_lower.endswith(ext):
+                      info['format'] = fmt
+                      break
 
-              return platform_info
+              return info
 
-          def calculate_sha256(filepath: Path) -> str:
-              sha256_hash = hashlib.sha256()
+          def sha256_file(filepath: Path) -> str:
+              h = hashlib.sha256()
               with open(filepath, 'rb') as f:
                   for chunk in iter(lambda: f.read(8192), b''):
-                      sha256_hash.update(chunk)
-              return sha256_hash.hexdigest()
+                      h.update(chunk)
+              return h.hexdigest()
 
           assets = []
-
           for filepath in sorted(release_dir.glob('*')):
-              if not filepath.is_file():
-                  continue
-
-              filename = filepath.name
-
-              # Skip manifest itself
-              if filename == 'manifest.json':
+              if not filepath.is_file() or filepath.name == 'manifest.json':
                   continue
 
               size = filepath.stat().st_size
-              platform_info = detect_platform(filename)
-
-              # Build download URL
-              if public_url:
-                  url = f"{public_url}/releases/{version}/{filename}"
-              else:
-                  url = f"releases/{version}/{filename}"
+              platform = detect_platform(filepath.name)
+              url = f"{public_url}/releases/{version}/{filepath.name}" if public_url else f"releases/{version}/{filepath.name}"
 
               asset = {
-                  'filename': filename,
+                  'filename': filepath.name,
                   'size': size,
                   'size_human': f"{size / (1024*1024):.1f} MB",
-                  'sha256': calculate_sha256(filepath),
-                  'platform': platform_info['os'],
-                  'arch': platform_info['arch'],
-                  'format': platform_info['format'],
+                  'sha256': sha256_file(filepath),
+                  'platform': platform['os'],
+                  'arch': platform['arch'],
+                  'format': platform['format'],
                   'url': url
               }
-
               assets.append(asset)
-              print(f"✓ {filename} ({asset['size_human']}) - {platform_info['os']}/{platform_info['arch']}")
+              print(f"✓ {filepath.name} ({asset['size_human']}) - {platform['os']}/{platform['arch']}")
 
           manifest = {
               'version': version,
@@ -504,13 +412,9 @@ jobs:
               'formats': list(set(a['format'] for a in assets if a['format'] != 'unknown'))
           }
 
-          manifest_path = release_dir / 'manifest.json'
-          with open(manifest_path, 'w') as f:
-              json.dump(manifest, f, indent=2)
-
+          (release_dir / 'manifest.json').write_text(json.dumps(manifest, indent=2))
           print(f"\n✓ Generated manifest with {len(assets)} assets")
 
-          # Write asset count to output
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"asset_count={len(assets)}\n")
           PYTHON_SCRIPT
@@ -520,7 +424,6 @@ jobs:
       - name: Verify downloads
         run: |
           RELEASE_DIR="binaries/${{ matrix.version }}"
-
           echo "::group::Downloaded files"
           if [[ -d "$RELEASE_DIR" ]]; then
             echo "Files in $RELEASE_DIR:"
@@ -567,12 +470,10 @@ jobs:
 
           mkdir -p binaries
 
-          # Move artifacts from download structure to final location
           for artifact_dir in downloaded-artifacts/release-*/; do
             if [[ -d "$artifact_dir" ]]; then
               version=$(basename "$artifact_dir" | sed 's/release-//')
               echo "Processing version: $version"
-
               mkdir -p "binaries/${version}"
               cp -r "${artifact_dir}"* "binaries/${version}/" 2>/dev/null || true
             fi
@@ -591,14 +492,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Check for changes
           if [[ -z "$(git status --porcelain binaries/)" ]]; then
             echo "No changes to commit"
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Add and commit
           git add binaries/
           git commit -m "chore: sync releases from R2 storage
 
@@ -610,8 +509,7 @@ jobs:
 
       - name: Push changes
         if: steps.commit.outputs.has_changes == 'true'
-        run: |
-          git push origin HEAD
+        run: git push origin HEAD
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -625,10 +523,7 @@ jobs:
 
           echo "::group::Creating GitHub Releases"
 
-          # Parse versions from JSON
-          VERSIONS=$(echo "$VERSIONS_JSON" | jq -r '.[]')
-
-          for VERSION in $VERSIONS; do
+          for VERSION in $(echo "$VERSIONS_JSON" | jq -r '.[]'); do
             RELEASE_DIR="binaries/${VERSION}"
 
             if [[ ! -d "$RELEASE_DIR" ]]; then
@@ -639,9 +534,7 @@ jobs:
             echo "Processing release: $VERSION"
 
             # Check if release exists
-            RELEASE_EXISTS=false
             if gh release view "$VERSION" &>/dev/null; then
-              RELEASE_EXISTS=true
               echo "  Release $VERSION already exists"
 
               if [[ "$FORCE_OVERWRITE" != "true" ]]; then
@@ -651,6 +544,7 @@ jobs:
 
               echo "  Deleting existing release for overwrite..."
               gh release delete "$VERSION" --yes || true
+              sleep 2
             fi
 
             # Collect release files (exclude manifest.json)
@@ -666,10 +560,10 @@ jobs:
 
             echo "  Found ${#FILES[@]} files to upload"
 
-            # Generate release notes from manifest
+            # Generate release notes
             RELEASE_NOTES="## Release $VERSION
 
-          This release was automatically synchronized from R2 storage.
+          Automatically synchronized from R2 storage.
 
           ### Assets
           "
@@ -678,9 +572,9 @@ jobs:
             fi
 
             # Determine if prerelease
-            IS_PRERELEASE=false
+            PRERELEASE_FLAG=""
             if [[ "$VERSION" =~ (alpha|beta|rc|dev|canary) ]]; then
-              IS_PRERELEASE=true
+              PRERELEASE_FLAG="--prerelease"
             fi
 
             # Create release
@@ -689,13 +583,12 @@ jobs:
               --title "Portless $VERSION" \
               --notes "$RELEASE_NOTES" \
               --draft=false \
-              --prerelease=$IS_PRERELEASE \
+              $PRERELEASE_FLAG \
               "${FILES[@]}"; then
               echo "  ✓ Created release $VERSION"
             else
               echo "  ::error::Failed to create release $VERSION"
             fi
-
           done
 
           echo "::endgroup::"
@@ -711,12 +604,6 @@ jobs:
     if: success() && inputs.dry_run != true && inputs.sync_all != true
 
     steps:
-      - name: Install AWS CLI
-        run: |
-          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
-          unzip -q /tmp/awscliv2.zip -d /tmp
-          sudo /tmp/aws/install --update
-
       - name: Update latest.json in R2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -835,4 +722,3 @@ jobs:
         if: failure()
         run: |
           echo "::error::Release sync workflow failed. Check the logs for details."
-          # Add Slack/Discord webhook notification here if needed
